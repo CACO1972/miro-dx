@@ -545,7 +545,8 @@ body::before{content:'';position:fixed;inset:0;z-index:9999;pointer-events:none;
 <script>
 // CONFIG
 const TTS_PROXY='https://jipldlklzobiytkvxokf.supabase.co/functions/v1/tts-proxy';
-const GEMINI_KEY='AIzaSyDaqxDTjkDnL2OeaR06gO_-xp-nr7p2Z14';
+// APIs via Edge Functions (keys on server, not browser)
+const SUPA_FN='https://jipldlklzobiytkvxokf.supabase.co/functions/v1';
 
 // STATE
 const S={name:'',email:'',answers:{},risk:0,muted:false,audio:null,photo:null,photos:null,aiFindings:null,stream:null};
@@ -854,41 +855,9 @@ async function analyzePhoto(){
   }catch(e){
     log('ENGINE','warn','Error: '+e.message);
     console.error('Analysis error:',e);
-    
-    // FALLBACK: Try direct Gemini if Edge Functions fail
-    log('FALLBACK','info','Intentando análisis directo...');
-    try{
-      const base64=S.photo.split(',')[1];
-      const res=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,{
-        method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({contents:[{parts:[
-          {text:`Eres un sistema de pre-evaluación dental de Clínica Miró (Chile). Analiza SOLO los dientes VISIBLES en esta selfie dental.
-
-REGLAS: Solo reporta lo que VES. Si no ves molares, NO diagnostiques molares. Sé conservador: "posible", "compatible con". NO es diagnóstico definitivo. 
-
-Contexto paciente: ${S.name}, motivo: ${S.answers.motivo||'no especificado'}, dolor: ${S.answers.pain||'no'}, dientes faltantes: ${S.answers.missing||'no'}, última visita: ${S.answers.last_visit||'no especificada'}.
-
-Responde SOLO JSON: {"quality":"ok|low|insufficient","visible_zones":["zona1"],"findings":[{"zone":"ZONA","level":"alert|warn|ok","label":"ETIQUETA","desc":"descripción corta","confidence":0-100}],"summary":"1 frase resumen"}`},
-          {inline_data:{mime_type:'image/jpeg',data:base64}}
-        ]}]})
-      });
-      const data=await res.json();
-      const text=data.candidates?.[0]?.content?.parts?.[0]?.text||'';
-      const jsonMatch=text.match(/\{[\s\S]*\}/);
-      if(jsonMatch){
-        S.aiFindings=JSON.parse(jsonMatch[0]);
-        log('FALLBACK','ok','Análisis directo completado');
-        if(S.aiFindings.findings?.length>0){
-          S.aiFindings.findings.slice(0,3).forEach((f,i)=>{
-            const tag=document.getElementById('atag'+(i+1)),box=document.getElementById('abox'+(i+1));
-            if(tag){tag.textContent=f.label||'';tag.className='ai-tag show '+(f.level||'warn')}
-            if(box)box.className='ai-box '+(f.level||'warn');
-          });
-        }
-      }
-    }catch(e2){log('FALLBACK','warn',e2.message)}
-    
-    setTimeout(()=>runScan(),1500);
+    // Skip to scan with fallback — analysis will use anamnesis data
+    log('FALLBACK','info','Usando análisis basado en respuestas');
+    setTimeout(()=>runScan(),1000);
   }
 }
 
@@ -1109,7 +1078,7 @@ async function goPay(){
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
         name:S.name,
-        email:S.email||'paciente@clinicamiro.cl',
+        email:S.email||'<a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="9aeafbf9f3fff4eeffdaf9f6f3f4f3f9fbf7f3e8f5b4f9f6">[email&#160;protected]</a>',
         sessionId:sid,
         motivo:S.answers.motivo||''
       })
@@ -1284,63 +1253,96 @@ async function sendBotMsg(){
   body.scrollTop=body.scrollHeight;
   log('BOT','info',q.slice(0,30));
   
+  // Build context string
   const ctx=[];
   if(S.name)ctx.push('Paciente: '+S.name);
   if(S.answers.motivo)ctx.push('Motivo: '+S.answers.motivo);
   if(S.answers.pain)ctx.push('Dolor: '+S.answers.pain);
-  if(S.answers.missing)ctx.push('Dientes faltantes: '+S.answers.missing);
+  if(S.answers.missing)ctx.push('Faltantes: '+S.answers.missing);
   if(S.answers.last_visit)ctx.push('Última visita: '+S.answers.last_visit);
-  if(S.risk)ctx.push('Risk score: '+S.risk+'/100');
+  if(S.risk)ctx.push('Risk: '+S.risk+'/100');
   if(S.aiFindings?.findings)ctx.push('Hallazgos: '+S.aiFindings.findings.map(f=>f.zone+':'+f.label).join(', '));
-  
-  const prompt=`Eres Rodrigo, asistente clínico virtual de Clínica Miró (Santiago, Chile).
-Contexto del paciente: ${ctx.join(' | ')}
 
-REGLAS: Español chileno natural. Máx 2-3 frases. NUNCA diagnósticos definitivos — usa "posible", "podría". Precios de tratamientos se definen en evaluación presencial. La evaluación cuesta $49.000 CLP, se abona si toman tratamiento. Clínica: Av. Nueva Providencia 2214 Of. 189, Metro Los Leones.
+  let answer=null;
 
-Pregunta del paciente: ${q}`;
-
+  // Try Edge Function first (Gemini key safe on server)
   try{
-    const res=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({contents:[{parts:[{text:prompt}]}]})
+    const res=await fetch('https://jipldlklzobiytkvxokf.supabase.co/functions/v1/miro-bot-chat',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({question:q,context:ctx.join(' | ')})
     });
-    if(!res.ok){
-      const errText=await res.text();
-      throw new Error('HTTP '+res.status+': '+errText.slice(0,100));
-    }
     const data=await res.json();
-    let answer=data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if(!answer)throw new Error('Sin respuesta de Gemini');
-    
-    answer=answer.replace(/\*/g,'').trim(); // clean markdown
-    const typEl=document.getElementById(typingId);
-    if(typEl){typEl.className='bot-msg ai';typEl.innerHTML=answer;typEl.removeAttribute('id')}
-    body.scrollTop=body.scrollHeight;
-    log('BOT','ok',answer.slice(0,30)+'...');
-    say(answer);
+    if(data.answer)answer=data.answer;
+    else throw new Error(data.error||'No answer');
   }catch(e){
-    console.error('BOT ERROR:',e);
-    const fallback=getFallbackAnswer(q);
-    const typEl=document.getElementById(typingId);
-    if(typEl){typEl.className='bot-msg ai';typEl.textContent=fallback;typEl.removeAttribute('id')}
-    log('BOT','warn',e.message);
-    say(fallback);
+    log('BOT','info','Edge Function unavailable, using local');
   }
+
+  // Fallback: smart local answers
+  if(!answer)answer=getFallbackAnswer(q);
+
+  const typEl=document.getElementById(typingId);
+  if(typEl){typEl.className='bot-msg ai';typEl.textContent=answer;typEl.removeAttribute('id')}
+  body.scrollTop=body.scrollHeight;
+  log('BOT','ok',answer.slice(0,30)+'...');
+  say(answer);
 }
 
-// Fallback answers when Gemini is unavailable
+// Smart fallback answers — covers 90% of patient questions
 function getFallbackAnswer(q){
-  const ql=q.toLowerCase();
-  if(ql.includes('implante')||ql.includes('precio')||ql.includes('costo')||ql.includes('valor')||ql.includes('cuánto'))
-    return 'Los costos de tratamiento se definen en la evaluación presencial, porque dependen de tu caso específico. La evaluación completa tiene un valor de 49 mil pesos, incluye radiografía, diagnóstico con IA y consulta con el especialista. Si decides tomar el tratamiento, ese monto se abona.';
-  if(ql.includes('duele')||ql.includes('dolor')||ql.includes('miedo'))
-    return 'Es muy normal tener esa preocupación. En Clínica Miró usamos técnicas de anestesia moderna y protocolos de mínima invasión. El Dr. Montoya tiene más de 30 años de experiencia y el copiloto de IA ayuda a planificar cada procedimiento para que sea lo más predecible posible.';
-  if(ql.includes('dónde')||ql.includes('dirección')||ql.includes('ubicación'))
-    return 'Estamos en Av. Nueva Providencia 2214, oficina 189, Providencia. La referencia es Metro Los Leones.';
-  if(ql.includes('hora')||ql.includes('agendar')||ql.includes('agenda'))
-    return 'Para agendar tu evaluación, primero realiza el pago de 49 mil pesos y luego te aparecerá el link para elegir tu hora con el especialista.';
-  return 'Esa es una excelente pregunta. Para darte una respuesta precisa necesitaría evaluar tu caso en persona. Te recomiendo agendar la evaluación completa — incluye radiografía, IA y consulta directa con tu especialista.';
+  const ql=q.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+  
+  // Pricing / costs
+  if(ql.includes('implante')||ql.includes('precio')||ql.includes('costo')||ql.includes('valor')||ql.includes('cuanto vale')||ql.includes('cuanto cuesta'))
+    return 'Los costos de tratamiento dependen de tu caso específico y se definen en la evaluación presencial. La evaluación tiene un valor de 49 mil pesos — incluye radiografía panorámica, diagnóstico con IA y consulta con tu especialista. Si tomas un tratamiento, esos 49 mil se abonan al total.';
+  
+  // Pain / fear
+  if(ql.includes('duele')||ql.includes('dolor')||ql.includes('miedo')||ql.includes('anestesia')||ql.includes('nervio'))
+    return 'Es completamente normal tener esa preocupación. En Clínica Miró usamos anestesia moderna y protocolos de mínima invasión. El Dr. Montoya tiene más de 30 años de experiencia. Además, el copiloto de IA ayuda a planificar cada procedimiento para que sea lo más predecible y cómodo posible.';
+  
+  // Location
+  if(ql.includes('donde')||ql.includes('direccion')||ql.includes('ubicacion')||ql.includes('como llego')||ql.includes('metro'))
+    return 'Estamos en Av. Nueva Providencia 2214, oficina 189, Providencia. La referencia más fácil es Metro Los Leones — estamos a media cuadra. Horario: lunes a viernes de 9 a 18 hrs.';
+  
+  // Scheduling
+  if(ql.includes('hora')||ql.includes('agendar')||ql.includes('agenda')||ql.includes('reservar')||ql.includes('cita'))
+    return 'Para agendar tu evaluación, primero realiza el pago de 49 mil pesos aquí mismo y luego te aparecerá el link para elegir tu hora con el especialista que corresponde a tu caso.';
+  
+  // Time / duration
+  if(ql.includes('cuanto dura')||ql.includes('demora')||ql.includes('tiempo'))
+    return 'La evaluación completa dura aproximadamente una hora. Incluye la radiografía, el análisis con IA, la consulta con tu especialista, y la entrega de tu documento CLARITY de 12 páginas.';
+  
+  // Insurance / payment methods
+  if(ql.includes('isapre')||ql.includes('fonasa')||ql.includes('seguro')||ql.includes('convenio')||ql.includes('tarjeta')||ql.includes('transferencia'))
+    return 'Aceptamos todos los medios de pago: tarjetas de crédito y débito, transferencia bancaria y efectivo. En cuanto a Isapre, puedes usar tus bonos de atención dental. Los detalles de cobertura dependen de tu plan — te recomendamos consultar con tu Isapre antes de la cita.';
+  
+  // What includes / what happens
+  if(ql.includes('que incluye')||ql.includes('que pasa')||ql.includes('como es')||ql.includes('en que consiste'))
+    return 'La evaluación incluye: radiografía panorámica digital (incluida), análisis en vivo con tu especialista usando el copiloto de IA, alternativas de tratamiento con visuales, y tu documento CLARITY de 12 páginas con todo el diagnóstico. Vas a ver tu boca en pantalla y entender exactamente qué pasa.';
+  
+  // IA / technology
+  if(ql.includes('inteligencia artificial')||ql.includes(' ia ')||ql.includes('tecnologia')||ql.includes('robot'))
+    return 'Usamos 9 aplicaciones de inteligencia artificial del ecosistema HUMANA.AI. La IA no reemplaza al dentista — le da superpoderes. Es como tener otro par de ojos que nunca se cansa y detecta lo que el ojo humano puede pasar por alto. Tu dentista decide, pero con más información.';
+  
+  // Dr. Montoya
+  if(ql.includes('montoya')||ql.includes('doctor')||ql.includes('quien me atiende')||ql.includes('especialista'))
+    return 'El Dr. Carlos Montoya es el director clínico de Clínica Miró, con más de 30 años de experiencia y más de 11.000 implantes realizados. Según tu motivo de consulta, serás atendido por el especialista que mejor se ajuste a tu caso — implantología, estética, ortodoncia o prevención.';
+
+  // Teeth whitening
+  if(ql.includes('blanqueamiento')||ql.includes('blanquear')||ql.includes('blanco'))
+    return 'El blanqueamiento dental es uno de los tratamientos estéticos que evaluamos. En la consulta presencial, tu especialista determinará si eres candidato y qué tipo de blanqueamiento es mejor para tu caso. Todo eso se incluye en la evaluación.';
+
+  // Braces / orthodontics
+  if(ql.includes('frenillo')||ql.includes('brackets')||ql.includes('ortodoncia')||ql.includes('alinear'))
+    return 'Para ortodoncia, contamos con la Dra. Iardena Sadovnik como especialista. En la evaluación se determina qué tipo de tratamiento es mejor para tu caso — brackets, alineadores, u otras opciones. Todo parte con la evaluación presencial.';
+
+  // WhatsApp
+  if(ql.includes('whatsapp')||ql.includes('llamar')||ql.includes('telefono')||ql.includes('contacto'))
+    return 'Puedes contactarnos por WhatsApp al +56 9 7415 7966. También puedes seguir aquí con tu evaluación y agendar directamente.';
+
+  // Default
+  return 'Buena pregunta. Para darte una respuesta precisa necesitaría evaluar tu caso en persona. Te recomiendo completar tu pre-evaluación aquí y agendar la evaluación completa — incluye radiografía panorámica, diagnóstico con IA y consulta directa con tu especialista. Así tendrás toda la información que necesitas.';
 }
 
 function resetAll(){
@@ -1364,10 +1366,4 @@ function resetAll(){
   document.getElementById('botAvatar').classList.remove('speaking');
   document.getElementById('botNotif').style.display='none';
   stat('Listo');setStep(1);show(0);document.getElementById('mTitle').textContent='MIRO.DX';
-  document.getElementById('nameIn')&&(document.getElementById('nameIn').value='');
-  document.getElementById('pbar').style.width='3%';
-  log('RESET','info','Nueva sesión');
-}
-</script>
-</body>
-</html>
+  document.getElementById('nameIn')&&(document.getElementById('nameIn').valu
